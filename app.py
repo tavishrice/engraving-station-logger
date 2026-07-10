@@ -1,20 +1,18 @@
 """
 Engraving Station Logger — Ikigai Cases.  (login/logout + tote scans + session stats)
 
-A standalone system (NOT connected to ShipHero). Each engraving station opens a page on its
-tablet. The engraver logs in (tap a name, or scan/type their badge), scans each tote as they
-finish it, and logs out at the end. Everything is written to your own spreadsheet as one event
-log:  ts, station, event, engraver, tote        (event = login | logout | scan)
+Standalone system (NOT connected to ShipHero). Each engraving station opens a page on its tablet.
+The engraver logs in (tap a name, or scan/type their badge), scans each tote as they finish it,
+and logs out. Everything is written to your own spreadsheet as one event log:
+    ts, station, event, engraver, tote        (event = login | logout | scan)
 
-Why: ShipHero attributes a pick to ONE person per order, so engraving credit can't live there.
-This is decoupled from ShipHero. Login/logout gives engraver HOURS automatically; each tote scan
-is stamped with the logged-in engraver (the output). The tablet shows the engraver their own live
-stats (totes this shift, time on shift, totes/hour).
+Sessions end automatically: after IDLE_MINUTES of no scans (default 15), and when the tablet's
+window/tab is closed (a logout beacon fires on page-hide). So a stale session never lingers.
 
-Env: STATIONS, ENGRAVERS (quick-pick names), SINK, GSHEET_WEBAPP_URL / CSV_PATH / GSHEET_*,
+Env: STATIONS, ENGRAVERS, IDLE_MINUTES, SINK, GSHEET_WEBAPP_URL / CSV_PATH / GSHEET_*,
      DEDUP_SECONDS, PORT
 """
-import os, json, queue, threading
+import os, json, threading
 from collections import deque, defaultdict
 from datetime import datetime, timezone
 
@@ -27,10 +25,12 @@ STATIONS = [s.strip() for s in os.environ.get(
 ENGRAVERS = [n.strip() for n in os.environ.get(
     "ENGRAVERS", "Halil Gurler,Manu Bekele,Maurice Williams").split(",") if n.strip()]
 DEDUP_SECONDS = int(os.environ.get("DEDUP_SECONDS", "45"))
+IDLE_SECONDS = int(float(os.environ.get("IDLE_MINUTES", "15")) * 60)
 
 _sink = make_sink()
-_current = {}
-_login_ts = {}
+_current = {}       # station -> engraver
+_login_ts = {}      # station -> iso login time
+_last_active = {}   # station -> iso time of last real action (login/scan)
 _recent = defaultdict(lambda: deque(maxlen=25))
 _count = defaultdict(int)
 _last = {}
@@ -39,6 +39,15 @@ _write_lock = threading.Lock()
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def _is_idle(station):
+    la = _last_active.get(station)
+    if not la:
+        return False
+    return (datetime.now(timezone.utc) - datetime.fromisoformat(la)).total_seconds() > IDLE_SECONDS
+
+def _clear(station):
+    _current.pop(station, None); _login_ts.pop(station, None); _last_active.pop(station, None)
 
 def emit(station, event, engraver="", tote="", note=""):
     """Write the event to the spreadsheet synchronously (reliable under gunicorn)."""
@@ -98,7 +107,7 @@ PAGE = """
 
   <div id="scanBox" class="hide">
     <div class="prompt">Scan each tote as you finish engraving it</div>
-    <div class="hint">One scan per finished tote. A repeat scan within a few seconds is ignored.</div>
+    <div class="hint">One scan per finished tote. Auto logs out after {{idle_min}} min idle or when this window closes.</div>
     <form id="scanForm" class="row"><input id="tote" type="text" placeholder="Scan finished tote&#8230;">
       <button class="btn" type="submit">Log tote</button></form>
     <div class="stats">
@@ -116,7 +125,7 @@ const station = {{ station_json|safe }};
 const ENGRAVERS = {{ engravers_json|safe }};
 const $=id=>document.getElementById(id);
 const flash=$('flash');
-let sinceMs=null, sessionCount=0;
+let sinceMs=null, sessionCount=0, loggedIn=false;
 function setFlash(c,m){flash.className='flash '+c;flash.textContent=m;}
 function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json());}
 function renderNames(){
@@ -133,14 +142,15 @@ function tick(){
 }
 setInterval(tick,1000);
 function setCount(c){sessionCount=c||0;$('s_count').textContent=sessionCount;tick();}
-function showLoggedOut(){sinceMs=null;$('status').textContent='not logged in';$('scanBox').classList.add('hide');$('loginBox').classList.remove('hide');$('badge').focus();}
+function showLoggedOut(){loggedIn=false;sinceMs=null;$('status').textContent='not logged in';$('scanBox').classList.add('hide');$('loginBox').classList.remove('hide');$('badge').focus();}
 function showLoggedIn(name,since,recent,count){
-  sinceMs = since?Date.parse(since):Date.now();
+  loggedIn=true; sinceMs = since?Date.parse(since):Date.now();
   $('status').innerHTML='&#9635; <b>'+name+'</b> &#8212; engraving';
   $('loginBox').classList.add('hide');$('scanBox').classList.remove('hide');
   setCount(count||0);render(recent||[]);tick();$('tote').focus();
 }
-function render(list){if(list.length)$('rows').innerHTML=list.map(x=>`<tr><td>${x.t}</td><td>${x.tote}</td></tr>`).join('');}
+function render(list){if(list.length)$('rows').innerHTML=list.map(x=>`<tr><td>${x.t}</td><td>${x.tote}</td></tr>`).join('');
+  else $('rows').innerHTML='<tr><td colspan="2" class="muted">no totes yet \\u2014 scan your first finished tote</td></tr>';}
 async function doLogin(name){name=(name||'').trim();if(!name)return;const j=await api('/login',{station,engraver:name});
   setFlash('ok','\\u2713 '+j.engraver+' \\u2014 you\\u2019re on. Now scan totes.');showLoggedIn(j.engraver,j.since,[],0);}
 $('loginForm').addEventListener('submit',e=>{e.preventDefault();const b=$('badge').value.trim();$('badge').value='';doLogin(b);});
@@ -148,14 +158,16 @@ $('scanForm').addEventListener('submit',async e=>{e.preventDefault();const t=$('
   const j=await api('/log',{station,tote:t});
   if(j.status==='ok')setFlash('ok','\\u2713 tote '+t+' logged');
   else if(j.status==='duplicate')setFlash('dup','\\u21bb '+t+' \\u2014 just scanned, skipped');
-  else if(j.status==='not_logged_in'){setFlash('err','\\u2715 tap your name first');showLoggedOut();return;}
+  else if(j.status==='not_logged_in'){setFlash('err','\\u2715 logged out \\u2014 tap your name to start again');showLoggedOut();return;}
   else setFlash('err','\\u2715 '+(j.message||'error'));
   if(j.recent)render(j.recent);if(j.count!=null)setCount(j.count);$('tote').focus();});
-$('logout').addEventListener('click',async()=>{await api('/logout',{station});setFlash('ok','logged out \\u2014 nice work');showLoggedOut();});
+$('logout').addEventListener('click',async()=>{loggedIn=false;await api('/logout',{station});setFlash('ok','logged out \\u2014 nice work');showLoggedOut();});
+window.addEventListener('pagehide',()=>{if(loggedIn){try{navigator.sendBeacon('/logout',new Blob([JSON.stringify({station})],{type:'application/json'}));}catch(e){}}});
 document.addEventListener('click',()=>{($('scanBox').classList.contains('hide')?$('badge'):$('tote')).focus();});
 renderNames();
 async function poll(){try{const r=await fetch('/state?station='+encodeURIComponent(station));const j=await r.json();
-  if(!j.engraver){showLoggedOut();}else{if(sinceMs==null)showLoggedIn(j.engraver,j.since,j.recent,j.count);else{setCount(j.count);render(j.recent||[]);}}}catch(e){}}
+  if(!j.engraver){if(loggedIn)setFlash('dup','logged out after inactivity \\u2014 tap your name to resume');showLoggedOut();}
+  else{if(sinceMs==null)showLoggedIn(j.engraver,j.since,j.recent,j.count);else{setCount(j.count);render(j.recent||[]);}}}catch(e){}}
 poll();setInterval(poll,20000);
 </script></body></html>
 """
@@ -176,20 +188,27 @@ def scan_page():
     if station not in STATIONS: return redirect("/")
     return render_template_string(PAGE, station=station,
                                   station_json=json.dumps(station),
-                                  engravers_json=json.dumps(ENGRAVERS))
+                                  engravers_json=json.dumps(ENGRAVERS),
+                                  idle_min=int(round(IDLE_SECONDS / 60)))
 
 @app.get("/health")
 def health():
     return jsonify(status="ok", stations=STATIONS, engravers=ENGRAVERS,
-                   sink=os.environ.get("SINK", "csv"),
+                   sink=os.environ.get("SINK", "csv"), idle_minutes=IDLE_SECONDS // 60,
                    logged_in={s: _current.get(s) for s in STATIONS})
 
 @app.get("/state")
 def state():
     station = request.args.get("station", "")
+    expired = None
     with _lock:
-        return jsonify(engraver=_current.get(station), since=_login_ts.get(station),
-                       count=_count.get(station, 0), recent=list(_recent.get(station, [])))
+        if _current.get(station) and _is_idle(station):
+            expired = _current.get(station); _clear(station)
+        resp = dict(engraver=_current.get(station), since=_login_ts.get(station),
+                    count=_count.get(station, 0), recent=list(_recent.get(station, [])))
+    if expired:
+        emit(station, "logout", engraver=expired, note="auto: inactivity")
+    return jsonify(resp)
 
 @app.post("/login")
 def login():
@@ -199,7 +218,7 @@ def login():
         return jsonify(status="error", message="missing station or name"), 400
     ts = now_iso()
     with _lock:
-        _current[station] = engraver; _login_ts[station] = ts
+        _current[station] = engraver; _login_ts[station] = ts; _last_active[station] = ts
         _count[station] = 0; _recent[station].clear()
     emit(station, "login", engraver=engraver)
     return jsonify(status="ok", engraver=engraver, since=ts)
@@ -209,8 +228,9 @@ def logout():
     d = request.get_json(silent=True) or {}
     station = (d.get("station") or "").strip()
     with _lock:
-        eng = _current.pop(station, ""); _login_ts.pop(station, None)
-    emit(station, "logout", engraver=eng)
+        eng = _current.get(station); _clear(station)
+    if eng:
+        emit(station, "logout", engraver=eng)
     return jsonify(status="ok")
 
 @app.post("/log")
@@ -219,20 +239,29 @@ def log_scan():
     station, tote = (d.get("station") or "").strip(), (d.get("tote") or "").strip()
     if station not in STATIONS or not tote:
         return jsonify(status="error", message="missing station or tote"), 400
+    expired = None; status = None; scan_eng = None; recent = None; count = None
     with _lock:
-        engraver = _current.get(station)
-        if not engraver:
-            return jsonify(status="not_logged_in"), 200
-        ts = now_iso(); key = (station, tote); prev = _last.get(key)
-        dup = prev and (datetime.fromisoformat(ts) - datetime.fromisoformat(prev)).total_seconds() < DEDUP_SECONDS
-        _last[key] = ts
-        if not dup:
-            _count[station] += 1
-            _recent[station].appendleft({"t": ts[11:19], "tote": tote})
-        recent, count = list(_recent[station]), _count[station]
-    if dup:
+        eng = _current.get(station)
+        if eng and _is_idle(station):
+            expired = eng; _clear(station); eng = None
+        if not eng:
+            status = "not_logged_in"
+        else:
+            ts = now_iso(); key = (station, tote); prev = _last.get(key)
+            dup = prev and (datetime.fromisoformat(ts) - datetime.fromisoformat(prev)).total_seconds() < DEDUP_SECONDS
+            _last[key] = ts; _last_active[station] = ts
+            if not dup:
+                _count[station] += 1
+                _recent[station].appendleft({"t": ts[11:19], "tote": tote})
+            status = "duplicate" if dup else "ok"; scan_eng = eng
+            recent, count = list(_recent[station]), _count[station]
+    if expired:
+        emit(station, "logout", engraver=expired, note="auto: inactivity")
+    if status == "not_logged_in":
+        return jsonify(status="not_logged_in"), 200
+    if status == "duplicate":
         return jsonify(status="duplicate", recent=recent, count=count)
-    emit(station, "scan", engraver=engraver, tote=tote)
+    emit(station, "scan", engraver=scan_eng, tote=tote)
     return jsonify(status="ok", recent=recent, count=count)
 
 if __name__ == "__main__":
