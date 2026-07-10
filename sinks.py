@@ -43,7 +43,30 @@ class GSheetSink:
         with self.lock: self.ws.append_rows(values, value_input_option="RAW")
         print(f"[gsheet] +{len(rows)}", flush=True)
 
+class WebAppSink:
+    """Posts each row to a Google Apps Script Web App URL, which appends it to the
+    bound Google Sheet. No service-account key needed — only the /exec URL (config)."""
+    def __init__(self, url):
+        import urllib.request, json as _json
+        self._url = url; self._req = urllib.request; self._json = _json
+        self.lock = threading.Lock()
+    def append_rows(self, rows):
+        ok = 0
+        for r in rows:
+            body = self._json.dumps({c: r.get(c, "") for c in COLUMNS}).encode()
+            req = self._req.Request(self._url, data=body,
+                                    headers={"Content-Type": "application/json"})
+            with self.lock:
+                try:
+                    self._req.urlopen(req, timeout=10).read(); ok += 1
+                except Exception as e:
+                    print("[webapp] error:", e, flush=True)
+        print(f"[webapp] posted {ok}/{len(rows)} row(s)", flush=True)
+
 def make_sink():
-    if os.environ.get("SINK", "csv").lower() == "gsheet":
+    kind = os.environ.get("SINK", "csv").lower()
+    if kind == "webapp":
+        return WebAppSink(os.environ["GSHEET_WEBAPP_URL"])
+    if kind == "gsheet":
         return GSheetSink(os.environ["GSHEET_ID"], os.environ.get("GSHEET_WORKSHEET", "Cart Scans"))
     return CsvSink(os.environ.get("CSV_PATH", "./cart_scans.csv"))
