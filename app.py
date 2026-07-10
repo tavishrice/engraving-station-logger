@@ -141,7 +141,7 @@ poll(); setInterval(poll, 20000);
 PICKER = """<!doctype html><meta charset=utf-8><title>Engraving Stations</title>
 <style>body{font-family:system-ui,Arial;background:#0f1720;color:#e7eef7;text-align:center;padding:40px}
 a{display:block;font-size:30px;background:#2E75B6;color:#fff;text-decoration:none;padding:22px;border-radius:14px;margin:14px auto;max-width:420px}</style>
-<h1>Pick this tablet's station</h1>{{links}}"""
+<h1>Pick this tablet's station</h1>{{ links|safe }}"""
 
 @app.get("/")
 def picker():
