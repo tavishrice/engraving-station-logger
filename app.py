@@ -98,7 +98,7 @@ PAGE = """
   </div>
 </main>
 <script>
-const station = {{station_json}};
+const station = {{ station_json|safe }};
 const $=id=>document.getElementById(id);
 const flash=$('flash');
 function setFlash(cls,msg){flash.className='flash '+cls;flash.textContent=msg;}
