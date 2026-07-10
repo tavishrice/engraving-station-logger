@@ -29,28 +29,27 @@ ENGRAVERS = [n.strip() for n in os.environ.get(
 DEDUP_SECONDS = int(os.environ.get("DEDUP_SECONDS", "45"))
 
 _sink = make_sink()
-_q: "queue.Queue" = queue.Queue()
 _current = {}
 _login_ts = {}
 _recent = defaultdict(lambda: deque(maxlen=25))
 _count = defaultdict(int)
 _last = {}
 _lock = threading.Lock()
+_write_lock = threading.Lock()
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-def _worker():
-    while True:
-        row = _q.get()
-        try: _sink.append_rows([row])
-        except Exception as e: print("[sink] error:", e, flush=True)
-        finally: _q.task_done()
-threading.Thread(target=_worker, daemon=True).start()
-
 def emit(station, event, engraver="", tote="", note=""):
-    _q.put({"ts": now_iso(), "station": station, "event": event,
-            "engraver": engraver, "tote": tote, "source": "station-tablet", "note": note})
+    """Write the event to the spreadsheet synchronously (reliable under gunicorn)."""
+    row = {"ts": now_iso(), "station": station, "event": event,
+           "engraver": engraver, "tote": tote, "source": "station-tablet", "note": note}
+    with _write_lock:
+        try:
+            _sink.append_rows([row])
+            print("[sink] wrote", event, station, tote, flush=True)
+        except Exception as e:
+            print("[sink] error:", repr(e), flush=True)
 
 PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
@@ -182,7 +181,8 @@ def scan_page():
 @app.get("/health")
 def health():
     return jsonify(status="ok", stations=STATIONS, engravers=ENGRAVERS,
-                   logged_in={s: _current.get(s) for s in STATIONS}, queue=_q.qsize())
+                   sink=os.environ.get("SINK", "csv"),
+                   logged_in={s: _current.get(s) for s in STATIONS})
 
 @app.get("/state")
 def state():
