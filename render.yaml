@@ -1,0 +1,21 @@
+# Render Blueprint — engraving station cart-scan logger.
+# New +  ->  Blueprint  ->  point at the repo with this folder.
+services:
+  - type: web
+    name: ikigai-engraving-station-logger
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT app:app
+    healthCheckPath: /health
+    envVars:
+      - key: STATIONS
+        value: "Engraving 1,Engraving 2,Engraving 3"
+      - key: SINK
+        value: gsheet
+      - key: GSHEET_ID
+        sync: false
+      - key: GSHEET_WORKSHEET
+        value: Cart Scans
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/service_account.json
