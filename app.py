@@ -1,5 +1,5 @@
 """
-Engraving Station Logger — Ikigai Cases.  (login/logout + tote scans)
+Engraving Station Logger — Ikigai Cases.  (login/logout + tote scans + session stats)
 
 A standalone system (NOT connected to ShipHero). Each engraving station opens a page on its
 tablet. The engraver logs in (tap a name, or scan/type their badge), scans each tote as they
@@ -8,7 +8,8 @@ log:  ts, station, event, engraver, tote        (event = login | logout | scan)
 
 Why: ShipHero attributes a pick to ONE person per order, so engraving credit can't live there.
 This is decoupled from ShipHero. Login/logout gives engraver HOURS automatically; each tote scan
-is stamped with the logged-in engraver (the output).
+is stamped with the logged-in engraver (the output). The tablet shows the engraver their own live
+stats (totes this shift, time on shift, totes/hour).
 
 Env: STATIONS, ENGRAVERS (quick-pick names), SINK, GSHEET_WEBAPP_URL / CSV_PATH / GSHEET_*,
      DEDUP_SECONDS, PORT
@@ -30,6 +31,7 @@ DEDUP_SECONDS = int(os.environ.get("DEDUP_SECONDS", "45"))
 _sink = make_sink()
 _q: "queue.Queue" = queue.Queue()
 _current = {}
+_login_ts = {}
 _recent = defaultdict(lambda: deque(maxlen=25))
 _count = defaultdict(int)
 _last = {}
@@ -60,7 +62,7 @@ PAGE = """
  header{background:#1F3B57;padding:16px 22px;display:flex;justify-content:space-between;align-items:center}
  header h1{margin:0;font-size:28px}
  header .status{font-size:18px;opacity:.92}
- main{padding:26px;max-width:840px;margin:0 auto}
+ main{padding:24px;max-width:860px;margin:0 auto}
  .prompt{font-size:27px;font-weight:800;margin:4px 0 4px}
  .hint{font-size:17px;opacity:.7;margin-bottom:18px}
  .flash{font-size:22px;padding:14px 18px;border-radius:12px;margin:12px 0;min-height:26px}
@@ -72,10 +74,14 @@ PAGE = """
  input[type=text]{flex:1;font-size:30px;padding:18px;border-radius:14px;border:2px solid #2E75B6;background:#0b121a;color:#fff}
  .btn{font-size:22px;font-weight:700;padding:0 26px;border:0;border-radius:14px;background:#2E75B6;color:#fff;cursor:pointer}
  .btn.out{background:#5b3a44}
+ .stats{display:flex;gap:14px;margin:6px 0 18px}
+ .card{flex:1;background:#16222e;border-radius:16px;padding:18px 12px;text-align:center}
+ .card .num{font-size:38px;font-weight:800;color:#7CE0A0;line-height:1.1}
+ .card .lab{font-size:14px;opacity:.7;margin-top:6px}
  table{width:100%;border-collapse:collapse;font-size:19px;margin-top:8px}td,th{padding:11px 8px;border-bottom:1px solid #22303f;text-align:left}
  .muted{opacity:.6;font-size:15px}a{color:#8fc1ee}.hide{display:none}
  .divider{opacity:.55;font-size:15px;text-align:center;margin:2px 0 12px}
- .bar{display:flex;justify-content:space-between;align-items:center;margin:14px 0}
+ .bar{display:flex;justify-content:flex-end;margin:12px 0}
 </style></head><body>
 <header><h1>{{station}}</h1><div class="status" id="status"></div></header>
 <main>
@@ -96,10 +102,14 @@ PAGE = """
     <div class="hint">One scan per finished tote. A repeat scan within a few seconds is ignored.</div>
     <form id="scanForm" class="row"><input id="tote" type="text" placeholder="Scan finished tote&#8230;">
       <button class="btn" type="submit">Log tote</button></form>
-    <div class="bar"><span class="muted"><span id="cnt">0</span> totes logged this session</span>
-      <button class="btn out" id="logout" type="button">Log out</button></div>
+    <div class="stats">
+      <div class="card"><div class="num" id="s_count">0</div><div class="lab">totes this shift</div></div>
+      <div class="card"><div class="num" id="s_time">0:00</div><div class="lab">time on shift</div></div>
+      <div class="card"><div class="num" id="s_rate">&#8212;</div><div class="lab">totes / hour</div></div>
+    </div>
+    <div class="bar"><button class="btn out" id="logout" type="button">Log out</button></div>
     <table><thead><tr><th>Time</th><th>Tote</th></tr></thead><tbody id="rows">
-      <tr><td colspan="2" class="muted">no totes yet</td></tr></tbody></table>
+      <tr><td colspan="2" class="muted">no totes yet &#8212; scan your first finished tote</td></tr></tbody></table>
   </div>
 </main>
 <script>
@@ -107,16 +117,33 @@ const station = {{ station_json|safe }};
 const ENGRAVERS = {{ engravers_json|safe }};
 const $=id=>document.getElementById(id);
 const flash=$('flash');
+let sinceMs=null, sessionCount=0;
 function setFlash(c,m){flash.className='flash '+c;flash.textContent=m;}
 function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json());}
 function renderNames(){
   $('names').innerHTML = ENGRAVERS.map((n,i)=>'<button data-i="'+i+'">'+n+'</button>').join('');
   Array.from($('names').children).forEach(b=>b.addEventListener('click',()=>doLogin(ENGRAVERS[+b.getAttribute('data-i')])));
 }
-function showLoggedOut(){$('status').textContent='not logged in';$('scanBox').classList.add('hide');$('loginBox').classList.remove('hide');$('badge').focus();}
-function showLoggedIn(name,recent,count){$('status').innerHTML='&#9635; <b>'+name+'</b> &#8212; engraving';$('loginBox').classList.add('hide');$('scanBox').classList.remove('hide');$('cnt').textContent=count||0;render(recent||[]);$('tote').focus();}
+function fmt(ms){var s=Math.max(0,Math.floor(ms/1000)),h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;
+  return h>0?(h+':'+String(m).padStart(2,'0')+':'+String(ss).padStart(2,'0')):(m+':'+String(ss).padStart(2,'0'));}
+function tick(){
+  if(sinceMs==null){$('s_time').textContent='0:00';$('s_rate').textContent='\\u2014';return;}
+  var ms=Date.now()-sinceMs; $('s_time').textContent=fmt(ms);
+  var hrs=ms/3600000; $('s_rate').textContent=(hrs>0.01&&sessionCount>0)?(sessionCount/hrs).toFixed(1):'\\u2014';
+  $('s_count').textContent=sessionCount;
+}
+setInterval(tick,1000);
+function setCount(c){sessionCount=c||0;$('s_count').textContent=sessionCount;tick();}
+function showLoggedOut(){sinceMs=null;$('status').textContent='not logged in';$('scanBox').classList.add('hide');$('loginBox').classList.remove('hide');$('badge').focus();}
+function showLoggedIn(name,since,recent,count){
+  sinceMs = since?Date.parse(since):Date.now();
+  $('status').innerHTML='&#9635; <b>'+name+'</b> &#8212; engraving';
+  $('loginBox').classList.add('hide');$('scanBox').classList.remove('hide');
+  setCount(count||0);render(recent||[]);tick();$('tote').focus();
+}
 function render(list){if(list.length)$('rows').innerHTML=list.map(x=>`<tr><td>${x.t}</td><td>${x.tote}</td></tr>`).join('');}
-async function doLogin(name){name=(name||'').trim();if(!name)return;const j=await api('/login',{station,engraver:name});setFlash('ok','\\u2713 '+j.engraver+' \\u2014 you\\u2019re on. Now scan totes.');showLoggedIn(j.engraver,[],0);}
+async function doLogin(name){name=(name||'').trim();if(!name)return;const j=await api('/login',{station,engraver:name});
+  setFlash('ok','\\u2713 '+j.engraver+' \\u2014 you\\u2019re on. Now scan totes.');showLoggedIn(j.engraver,j.since,[],0);}
 $('loginForm').addEventListener('submit',e=>{e.preventDefault();const b=$('badge').value.trim();$('badge').value='';doLogin(b);});
 $('scanForm').addEventListener('submit',async e=>{e.preventDefault();const t=$('tote').value.trim();if(!t){$('tote').focus();return;}$('tote').value='';
   const j=await api('/log',{station,tote:t});
@@ -124,11 +151,12 @@ $('scanForm').addEventListener('submit',async e=>{e.preventDefault();const t=$('
   else if(j.status==='duplicate')setFlash('dup','\\u21bb '+t+' \\u2014 just scanned, skipped');
   else if(j.status==='not_logged_in'){setFlash('err','\\u2715 tap your name first');showLoggedOut();return;}
   else setFlash('err','\\u2715 '+(j.message||'error'));
-  if(j.recent)render(j.recent);if(j.count!=null)$('cnt').textContent=j.count;$('tote').focus();});
-$('logout').addEventListener('click',async()=>{await api('/logout',{station});setFlash('ok','logged out');showLoggedOut();});
+  if(j.recent)render(j.recent);if(j.count!=null)setCount(j.count);$('tote').focus();});
+$('logout').addEventListener('click',async()=>{await api('/logout',{station});setFlash('ok','logged out \\u2014 nice work');showLoggedOut();});
 document.addEventListener('click',()=>{($('scanBox').classList.contains('hide')?$('badge'):$('tote')).focus();});
 renderNames();
-async function poll(){try{const r=await fetch('/state?station='+encodeURIComponent(station));const j=await r.json();if(!j.engraver)showLoggedOut();else{$('cnt').textContent=j.count;render(j.recent||[]);}}catch(e){}}
+async function poll(){try{const r=await fetch('/state?station='+encodeURIComponent(station));const j=await r.json();
+  if(!j.engraver){showLoggedOut();}else{if(sinceMs==null)showLoggedIn(j.engraver,j.since,j.recent,j.count);else{setCount(j.count);render(j.recent||[]);}}}catch(e){}}
 poll();setInterval(poll,20000);
 </script></body></html>
 """
@@ -160,8 +188,8 @@ def health():
 def state():
     station = request.args.get("station", "")
     with _lock:
-        return jsonify(engraver=_current.get(station), count=_count.get(station, 0),
-                       recent=list(_recent.get(station, [])))
+        return jsonify(engraver=_current.get(station), since=_login_ts.get(station),
+                       count=_count.get(station, 0), recent=list(_recent.get(station, [])))
 
 @app.post("/login")
 def login():
@@ -169,17 +197,19 @@ def login():
     station, engraver = (d.get("station") or "").strip(), (d.get("engraver") or "").strip()
     if station not in STATIONS or not engraver:
         return jsonify(status="error", message="missing station or name"), 400
+    ts = now_iso()
     with _lock:
-        _current[station] = engraver; _count[station] = 0; _recent[station].clear()
+        _current[station] = engraver; _login_ts[station] = ts
+        _count[station] = 0; _recent[station].clear()
     emit(station, "login", engraver=engraver)
-    return jsonify(status="ok", engraver=engraver)
+    return jsonify(status="ok", engraver=engraver, since=ts)
 
 @app.post("/logout")
 def logout():
     d = request.get_json(silent=True) or {}
     station = (d.get("station") or "").strip()
     with _lock:
-        eng = _current.pop(station, "")
+        eng = _current.pop(station, ""); _login_ts.pop(station, None)
     emit(station, "logout", engraver=eng)
     return jsonify(status="ok")
 
