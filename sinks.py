@@ -1,9 +1,12 @@
 """Sinks for the engraving-station cart-scan logger.
 
-  SINK=csv    -> append to a local CSV (zero setup; good for testing)
-  SINK=gsheet -> append to a Google Sheet via a service account (gspread)
+  SINK=csv        -> append to a local CSV (zero setup; good for testing)
+  SINK=gsheet     -> append to a Google Sheet via a service account (gspread)
+  SINK=webapp     -> POST each row to a Google Apps Script Web App (the Sheet)
+  SINK=pg         -> insert each event into Postgres (the contribution store)
+  SINK=pg+webapp  -> DUAL WRITE: Postgres AND the Sheet (safe during transition)
 
-Both expose: sink.append_rows(list_of_dicts).
+All expose: sink.append_rows(list_of_dicts).
 """
 import csv, os, threading
 
@@ -63,10 +66,52 @@ class WebAppSink:
                     print("[webapp] error:", e, flush=True)
         print(f"[webapp] posted {ok}/{len(rows)} row(s)", flush=True)
 
+class PgSink:
+    """Insert each logger event into the Postgres `event` table (stage='engrave').
+    Same store the Tote Complete webhook writes to, so scans + tote contents can be
+    joined for engraving credit."""
+    ALIAS = {"User-777001": "Maurice Williams"}   # canonicalize known aliases
+    INSERT = ("INSERT INTO event (ts,person,stage,station,action,tote_barcode,source,dedup_key) "
+              "VALUES (%s,%s,'engrave',%s,%s,%s,'logger',%s) ON CONFLICT (dedup_key) DO NOTHING")
+
+    def __init__(self):
+        from db import connect
+        self._connect = connect
+        self.lock = threading.Lock()
+
+    def append_rows(self, rows):
+        wrote = 0
+        with self.lock:
+            with self._connect() as c, c.cursor() as cur:
+                for r in rows:
+                    person = self.ALIAS.get(r.get("engraver"), r.get("engraver"))
+                    tote = r.get("tote")
+                    tote = str(tote) if tote not in (None, "") else None
+                    ts, action = r.get("ts"), r.get("event")
+                    dedup = "|".join(["logger", str(ts), str(person), action or "", tote or ""])
+                    cur.execute(self.INSERT, (ts, person, r.get("station"), action, tote, dedup))
+                    wrote += cur.rowcount
+                c.commit()
+        print(f"[pg] +{wrote} event(s)", flush=True)
+
+class MultiSink:
+    """Fan out to several sinks; one sink failing never blocks the others."""
+    def __init__(self, sinks): self.sinks = sinks
+    def append_rows(self, rows):
+        for s in self.sinks:
+            try: s.append_rows(rows)
+            except Exception as e:
+                print(f"[multi] {type(s).__name__} error: {e!r}", flush=True)
+
+def _one(kind):
+    kind = kind.strip().lower()
+    if kind == "webapp": return WebAppSink(os.environ["GSHEET_WEBAPP_URL"])
+    if kind == "gsheet": return GSheetSink(os.environ["GSHEET_ID"], os.environ.get("GSHEET_WORKSHEET", "Cart Scans"))
+    if kind == "pg":     return PgSink()
+    return CsvSink(os.environ.get("CSV_PATH", "./cart_scans.csv"))
+
 def make_sink():
     kind = os.environ.get("SINK", "csv").lower()
-    if kind == "webapp":
-        return WebAppSink(os.environ["GSHEET_WEBAPP_URL"])
-    if kind == "gsheet":
-        return GSheetSink(os.environ["GSHEET_ID"], os.environ.get("GSHEET_WORKSHEET", "Cart Scans"))
-    return CsvSink(os.environ.get("CSV_PATH", "./cart_scans.csv"))
+    if "+" in kind:                       # e.g. "pg+webapp" -> dual write
+        return MultiSink([_one(k) for k in kind.split("+")])
+    return _one(kind)
