@@ -9,16 +9,22 @@
 All expose: sink.append_rows(list_of_dicts).
 
 --- Live Postgres path (2026-07-15) -------------------------------------------------
-PgSink now writes OUT OF BAND: append_rows() only enqueues rows (instant, never
-touches the network), and a single background daemon thread drains the queue and
-writes to Postgres. This is the fix for the earlier outage, where a synchronous
-psycopg.connect() with no timeout hung the logger's single gunicorn worker whenever
-the DB was momentarily unreachable. Now the scan request can NEVER block on the DB:
-worst case a row waits in the queue (or, if the DB is down long enough to fill the
-queue, is dropped — the Google Sheet dual-write remains the backup). Combined with
-db.connect()'s connect_timeout, a bad DB never affects scanning.
+PgSink writes SYNCHRONOUSLY but SAFELY. The earlier outage was caused by a synchronous
+psycopg.connect() with NO timeout: when the DB was momentarily unreachable the single
+gunicorn worker hung forever and the scan station went down. Two things prevent that now:
+  1. db.connect() uses connect_timeout (see db.py) so a bad DB fails fast (<= ~8s),
+     never an infinite hang.
+  2. append_rows() NEVER raises — any DB error is caught and logged, and because the
+     logger runs SINK=pg+webapp, the Google Sheet dual-write always still has the row.
+So the worst case when the DB is unreachable is a few seconds of extra latency per scan
+(then it recovers), not an outage.
+
+(An earlier attempt wrote to PG from a background daemon thread to keep the request
+path instant. That works locally and in a direct container shell, but the daemon
+thread does not get scheduled inside Render's single sync gunicorn worker, so rows
+never flushed over HTTP. Synchronous + connect_timeout is simpler and reliable.)
 """
-import csv, os, threading, queue, time
+import csv, os, threading
 
 COLUMNS = [
     "ts",           # UTC time of the event
@@ -81,32 +87,16 @@ class PgSink:
     Same store the Tote Complete webhook writes to, so scans + tote contents can be
     joined for engraving credit (the join lives in refresh_contribution_day()).
 
-    Writes happen in a BACKGROUND daemon thread — append_rows() only enqueues, so the
-    scan request path never touches the DB and can never hang on it."""
+    Synchronous but SAFE: bounded by db.connect()'s connect_timeout and never raises,
+    so a DB problem costs a little latency, never the scan station (see module docstring)."""
     ALIAS = {"User-777001": "Maurice Williams"}   # canonicalize known aliases
     INSERT = ("INSERT INTO event (ts,person,stage,station,action,tote_barcode,source,dedup_key) "
               "VALUES (%s,%s,'engrave',%s,%s,%s,'logger',%s) ON CONFLICT (dedup_key) DO NOTHING")
-    QUEUE_MAX  = int(os.environ.get("PG_QUEUE_MAX", "20000"))
-    BATCH_MAX  = int(os.environ.get("PG_BATCH_MAX", "200"))
-    RETRIES    = int(os.environ.get("PG_RETRIES", "3"))
 
     def __init__(self):
         from db import connect
         self._connect = connect
-        self._q = queue.Queue(maxsize=self.QUEUE_MAX)
-        self._t = threading.Thread(target=self._worker, name="pgsink", daemon=True)
-        self._t.start()
-        print("[pg] async writer thread started", flush=True)
-
-    def append_rows(self, rows):
-        """Request-path safe: just enqueue. Never connects, never blocks, never raises."""
-        n = 0
-        for r in rows:
-            try:
-                self._q.put_nowait(dict(r)); n += 1
-            except queue.Full:
-                print("[pg] queue full — dropped 1 row (Sheet dual-write still has it)", flush=True)
-        return n
+        self.lock = threading.Lock()
 
     def _rowvals(self, r):
         person = self.ALIAS.get(r.get("engraver"), r.get("engraver"))
@@ -116,30 +106,20 @@ class PgSink:
         dedup = "|".join(["logger", str(ts), str(person), action or "", tote or ""])
         return (ts, person, r.get("station"), action, tote, dedup)
 
-    def _worker(self):
-        while True:
-            batch = [self._q.get()]                       # block until there is work
-            while len(batch) < self.BATCH_MAX:
-                try: batch.append(self._q.get_nowait())
-                except queue.Empty: break
-            vals = [self._rowvals(r) for r in batch]
-            for attempt in range(self.RETRIES):
-                try:
-                    with self._connect() as c, c.cursor() as cur:
-                        cur.executemany(self.INSERT, vals)
-                        c.commit()
-                    print(f"[pg] +{len(vals)} event(s)", flush=True)
-                    break
-                except Exception as e:
-                    wait = 2 * (attempt + 1)
-                    print(f"[pg] write failed (attempt {attempt+1}/{self.RETRIES}): {e!r} "
-                          f"— retrying in {wait}s", flush=True)
-                    time.sleep(wait)
-            else:
-                print(f"[pg] GAVE UP on {len(vals)} row(s) after {self.RETRIES} tries "
-                      f"(Sheet dual-write still has them)", flush=True)
-            for _ in batch:
-                self._q.task_done()
+    def append_rows(self, rows):
+        vals = [self._rowvals(r) for r in rows]
+        if not vals:
+            return 0
+        try:
+            with self.lock, self._connect() as c, c.cursor() as cur:
+                cur.executemany(self.INSERT, vals)
+                c.commit()
+            print(f"[pg] +{len(vals)} event(s)", flush=True)
+            return len(vals)
+        except Exception as e:
+            # NEVER propagate into the request path — the Google Sheet dual-write keeps the row.
+            print(f"[pg] write failed (row kept in Sheet): {e!r}", flush=True)
+            return 0
 
 class MultiSink:
     """Fan out to several sinks; one sink failing never blocks the others."""
