@@ -12,7 +12,7 @@ window/tab is closed (a logout beacon fires on page-hide). So a stale session ne
 Env: STATIONS, ENGRAVERS, IDLE_MINUTES, SINK, GSHEET_WEBAPP_URL / CSV_PATH / GSHEET_*,
      DEDUP_SECONDS, PORT
 """
-import os, json, threading
+import os, json, threading, time, re, urllib.request, urllib.error
 from collections import deque, defaultdict
 from datetime import datetime, timezone
 
@@ -24,6 +24,48 @@ STATIONS = [s.strip() for s in os.environ.get(
     "STATIONS", "Engraving 1,Engraving 2,Engraving 3").split(",") if s.strip()]
 ENGRAVERS = [n.strip() for n in os.environ.get(
     "ENGRAVERS", "Halil Gurler,Manu Bekele,Maurice Williams").split(",") if n.strip()]
+# --- live engraver roster (from the contribution app's HR-synced /roster) --------
+# Buttons + an allow-list refresh from HR in the background so mis-scans/junk can't
+# become an engraver. Never called in a request path; always falls back to the env
+# list above, so the tablet keeps working even if the roster is unreachable.
+ROSTER_URL = os.environ.get(
+    "ROSTER_URL", "https://ikigai-contribution-api.onrender.com/roster")
+ROSTER_REFRESH_SECONDS = int(os.environ.get("ROSTER_REFRESH_SECONDS", "600"))
+_live_engravers = list(ENGRAVERS)   # name buttons shown on the tablet
+_roster_lock = threading.Lock()
+
+def _refresh_roster():
+    try:
+        req = urllib.request.Request(ROSTER_URL, headers={"User-Agent": "engraving-logger"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        engr = [n for n in (d.get("engravers") or []) if n]
+        if engr:
+            with _roster_lock:
+                _live_engravers[:] = engr
+            print("[roster] refreshed: %d name buttons" % len(engr), flush=True)
+    except Exception as e:
+        print("[roster] refresh failed (keeping current list):", repr(e), flush=True)
+
+def _roster_loop():
+    while True:
+        _refresh_roster()
+        time.sleep(ROSTER_REFRESH_SECONDS)
+
+try:                                 # gunicorn -w 1 -> one background refresher
+    threading.Thread(target=_roster_loop, daemon=True).start()
+except Exception as _e:
+    print("[roster] could not start refresh thread:", repr(_e), flush=True)
+
+def current_engravers():
+    with _roster_lock:
+        return list(_live_engravers)
+
+def _valid_engraver(name):
+    """A real engraver name has letters; a mis-scanned tote barcode is all digits.
+    Requiring >=2 letters blocks barcode/junk logins with no risk of locking out a
+    real person (we do NOT hard-require roster membership, to avoid false rejects)."""
+    return sum(ch.isalpha() for ch in (name or "")) >= 2
 DEDUP_SECONDS = int(os.environ.get("DEDUP_SECONDS", "45"))
 IDLE_SECONDS = int(float(os.environ.get("IDLE_MINUTES", "15")) * 60)
 
@@ -188,12 +230,12 @@ def scan_page():
     if station not in STATIONS: return redirect("/")
     return render_template_string(PAGE, station=station,
                                   station_json=json.dumps(station),
-                                  engravers_json=json.dumps(ENGRAVERS),
+                                  engravers_json=json.dumps(current_engravers()),
                                   idle_min=int(round(IDLE_SECONDS / 60)))
 
 @app.get("/health")
 def health():
-    return jsonify(status="ok", stations=STATIONS, engravers=ENGRAVERS,
+    return jsonify(status="ok", stations=STATIONS, engravers=current_engravers(),
                    sink=os.environ.get("SINK", "csv"), idle_minutes=IDLE_SECONDS // 60,
                    logged_in={s: _current.get(s) for s in STATIONS})
 
@@ -216,6 +258,9 @@ def login():
     station, engraver = (d.get("station") or "").strip(), (d.get("engraver") or "").strip()
     if station not in STATIONS or not engraver:
         return jsonify(status="error", message="missing station or name"), 400
+    if not _valid_engraver(engraver):
+        return jsonify(status="error",
+                       message="That doesn\u2019t look like a name \u2014 tap your name button."), 400
     ts = now_iso()
     with _lock:
         _current[station] = engraver; _login_ts[station] = ts; _last_active[station] = ts
