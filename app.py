@@ -33,29 +33,36 @@ ROSTER_URL = os.environ.get(
 ROSTER_REFRESH_SECONDS = int(os.environ.get("ROSTER_REFRESH_SECONDS", "600"))
 _live_engravers = list(ENGRAVERS)   # name buttons shown on the tablet
 _roster_lock = threading.Lock()
+_next_refresh = 0.0
 
 def _refresh_roster():
     try:
         req = urllib.request.Request(ROSTER_URL, headers={"User-Agent": "engraving-logger"})
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with urllib.request.urlopen(req, timeout=6) as r:
             d = json.loads(r.read().decode("utf-8"))
         engr = [n for n in (d.get("engravers") or []) if n]
         if engr:
             with _roster_lock:
                 _live_engravers[:] = engr
             print("[roster] refreshed: %d name buttons" % len(engr), flush=True)
+            return True
     except Exception as e:
         print("[roster] refresh failed (keeping current list):", repr(e), flush=True)
+    return False
 
-def _roster_loop():
-    while True:
-        _refresh_roster()
-        time.sleep(ROSTER_REFRESH_SECONDS)
-
-try:                                 # gunicorn -w 1 -> one background refresher
-    threading.Thread(target=_roster_loop, daemon=True).start()
-except Exception as _e:
-    print("[roster] could not start refresh thread:", repr(_e), flush=True)
+def maybe_refresh():
+    """Refresh the button roster from HR lazily, IN THE WORKER PROCESS (a thread
+    started at import runs in the gunicorn arbiter and dies at fork, so it can't
+    update the worker). Time-guarded; never on the hot /log scan path; short
+    timeout + fallback so a cold contribution-api can't hang a page load. The
+    frequent /health ping keeps it fresh without anyone loading the page."""
+    global _next_refresh
+    now = time.time()
+    if now < _next_refresh:
+        return
+    _next_refresh = now + 60                    # tentative: quick retry on failure/stampede
+    if _refresh_roster():
+        _next_refresh = now + ROSTER_REFRESH_SECONDS
 
 def current_engravers():
     with _roster_lock:
@@ -226,6 +233,7 @@ def picker():
 
 @app.get("/scan")
 def scan_page():
+    maybe_refresh()
     station = request.args.get("station", "")
     if station not in STATIONS: return redirect("/")
     return render_template_string(PAGE, station=station,
@@ -235,6 +243,7 @@ def scan_page():
 
 @app.get("/health")
 def health():
+    maybe_refresh()
     return jsonify(status="ok", stations=STATIONS, engravers=current_engravers(),
                    sink=os.environ.get("SINK", "csv"), idle_minutes=IDLE_SECONDS // 60,
                    logged_in={s: _current.get(s) for s in STATIONS})
