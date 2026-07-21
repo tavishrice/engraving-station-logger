@@ -122,8 +122,15 @@ SCAN_PAGE = """
     <div class="hint">{{scan_hint}} Auto logs out after {{idle_min}} min idle.</div>
     <form id="scanForm" class="row"><input id="scan" type="text" placeholder="Scan {{noun}}&#8230;" autocomplete="off">
       <button class="btn" type="submit">Log {{noun}}</button></form>
+    <div id="manualBox" class="hide" style="margin:6px 0 12px;padding:14px;border:1px solid #7a5;border-radius:12px;background:#1a2a1e">
+      <div class="prompt" style="font-size:19px;margin:0 0 4px">That didn&#8217;t read as a full order&#160;#</div>
+      <div class="hint" style="margin:0 0 8px">Scanned &#8220;<span id="mRaw"></span>&#8221;. Type the order number from the packing slip (IC&#160;+&#160;6&#160;digits).</div>
+      <form id="manualForm" class="row"><input id="manual" type="text" autocomplete="off" placeholder="e.g. IC201854">
+        <button class="btn" type="submit">Confirm order</button></form>
+      <div class="muted" style="margin-top:8px"><a href="#" id="mCancel">cancel &#8212; back to scanning</a></div>
+    </div>
     <div class="stats">
-      <div class="card total"><div class="num" id="s_count">0</div><div class="lab">{{noun_plural}} this shift</div></div>
+      <div class="card total"><div class="num" id="s_count">0</div><div class="lab">{{noun_plural}} {{ 'today' if mode=='fulfillment' else 'this shift' }}</div></div>
       <div class="card"><div class="num" id="s_time">0:00</div><div class="lab">time on shift</div></div>
       <div class="card"><div class="num" id="s_rate">&#8212;</div><div class="lab">{{noun_plural}} / hour</div></div>
     </div>
@@ -145,7 +152,7 @@ SCAN_PAGE = """
 <script>
 function deviceSid(){try{var k='ik_fulfill_sid';var v=localStorage.getItem(k);if(!v){v='dev-'+Math.random().toString(36).slice(2,10)+Date.now().toString(36);localStorage.setItem(k,v);}return v;}catch(e){return 'dev-x';}}
 const CFG={station:{{ 'null' if device_session else (station|tojson) }}, deviceSession:{{ 'true' if device_session else 'false' }},
-  names:{{names|tojson}}, mode:{{mode|tojson}},
+  names:{{names|tojson}}, mode:{{mode|tojson}}, validateOrder:{{ 'true' if mode=='fulfillment' else 'false' }},
   epLogin:{{ep_login|tojson}}, epLog:{{ep_log|tojson}}, epLogout:{{ep_logout|tojson}},
   epState:{{ep_state|tojson}}, epUndo:{{ep_undo|tojson}}, scanKey:{{scan_key|tojson}},
   noun:{{noun|tojson}}, nounPlural:{{noun_plural|tojson}}};
@@ -224,8 +231,17 @@ async function sendScan(val){
   try{const j=await api(CFG.epLog,scanBody(val));handleResp(j,val);}
   catch(e){pending.push(val);pendBadge();ensureRetry();feedback('dup');setFlash('dup','\\u27f3 '+val+' saved \\u2014 offline, will retry ('+pending.length+')');}
 }
+// order-format check (Ikigai orders are IC + 6 digits; a bare 6-digit core is fine too).
+function orderAlnum(v){return (v||'').toUpperCase().replace(/[^A-Z0-9]/g,'');}
+function looksLikeOrder(v){return /^(IC)?[0-9]{6}$/.test(orderAlnum(v));}
+var mBox=$('manualBox');
+function showManual(raw){if(!mBox){sendScan(raw);return;}$('mRaw').textContent=raw;var m=$('manual');var d=(raw||'').replace(/[^0-9]/g,'');m.value=d?('IC'+d):'';$('scanForm').classList.add('hide');mBox.classList.remove('hide');feedback('err');setFlash('err','\\u2715 '+raw+' \\u2014 not a full order #, type it in');m.focus();m.select();}
+function hideManual(){if(mBox)mBox.classList.add('hide');$('scanForm').classList.remove('hide');$('scan').focus();}
+if($('manualForm')){$('manualForm').addEventListener('submit',function(e){e.preventDefault();var v=$('manual').value.trim();if(!looksLikeOrder(v)){feedback('err');setFlash('err','still not a 6-digit order \\u2014 check the packing slip');$('manual').focus();return;}var now=Date.now();lastVal=v;lastT=now;hideManual();sendScan(v);});}
+if($('mCancel')){$('mCancel').addEventListener('click',function(e){e.preventDefault();hideManual();});}
 $('scanForm').addEventListener('submit',e=>{e.preventDefault();var t=$('scan').value.trim();$('scan').value='';if(!t){$('scan').focus();return;}
   var now=Date.now();if(t===lastVal&&now-lastT<800){$('scan').focus();return;}lastVal=t;lastT=now;
+  if(CFG.validateOrder&&!looksLikeOrder(t)){showManual(t);return;}
   sendScan(t);$('scan').focus();});
 
 var undoBtn=$('undo');
@@ -417,6 +433,11 @@ def f_state():
     with _lock:
         if _current.get(key) and _is_idle(key):
             _clear(key)
+        who = _current.get(key)
+    dbc = fulfill_store.day_count(who) if who else None   # reconcile tile to DB day total
+    with _lock:
+        if who and _current.get(key) == who and dbc is not None:
+            _count[key] = max(dbc, _count.get(key, 0))     # never flicker backward on write lag
         resp = dict(engraver=_current.get(key), since=_login_ts.get(key),
                     count=_count.get(key, 0), recent=list(_recent.get(key, [])))
     return jsonify(resp)
@@ -427,11 +448,12 @@ def f_login():
     key, who = (d.get("station") or "").strip(), (d.get("engraver") or "").strip()
     if not key or not who:
         return jsonify(status="error", message="missing session or name"), 400
+    seed = fulfill_store.day_count(who)          # per-person-per-day, not per-login
     ts = now_iso()
     with _lock:
         _current[key] = who; _login_ts[key] = ts; _last_active[key] = ts
-        _count[key] = 0; _recent[key].clear()
-    print("[fulfill] login", who, flush=True)
+        _count[key] = seed if seed is not None else 0; _recent[key].clear()
+    print("[fulfill] login", who, "day_count=", seed, flush=True)
     return jsonify(status="ok", engraver=who, since=ts)
 
 @app.post("/fulfill/logout")
