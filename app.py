@@ -120,6 +120,14 @@ SCAN_PAGE = """
   <div id="scanBox" class="hide">
     <div class="prompt">Scan each {{noun}} as you {{scan_verb}} it</div>
     <div class="hint">{{scan_hint}} Auto logs out after {{idle_min}} min idle.</div>
+    {% if mode=='fulfillment' %}
+    <div style="margin:4px 0 14px;padding:14px 16px;border:1px solid #2b4a3c;border-radius:14px;background:linear-gradient(160deg,#14261d,#152230)">
+      <div style="font-size:18px;font-weight:800;color:#7CE0A0;margin-bottom:8px">Scan whichever barcode reads &#8212; both work:</div>
+      <div style="font-size:17px;margin:4px 0"><b style="color:#7CE0A0">1.</b>&#160; the <b>order number</b> on the packing slip (IC + 6 digits)</div>
+      <div style="font-size:17px;margin:4px 0"><b style="color:#7CE0A0">2.</b>&#160; or the <b>shipping-label tracking</b> barcode</div>
+      <div class="muted" style="margin-top:8px">If neither one scans, it&#8217;ll ask you to type the order number.</div>
+    </div>
+    {% endif %}
     <form id="scanForm" class="row"><input id="scan" type="text" placeholder="Scan {{noun}}&#8230;" autocomplete="off">
       <button class="btn" type="submit">Log {{noun}}</button></form>
     <div id="manualBox" class="hide" style="margin:6px 0 12px;padding:14px;border:1px solid #7a5;border-radius:12px;background:#1a2a1e">
