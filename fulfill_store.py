@@ -25,6 +25,11 @@ import os, json, queue, threading, time
 from datetime import datetime, timezone
 
 try:
+    import psycopg                     # for the small per-person day-count read
+except Exception:                      # pragma: no cover
+    psycopg = None
+
+try:
     from db import connect          # shared fail-fast Postgres helper
 except Exception as _e:             # pragma: no cover - keeps app bootable w/o db.py
     connect = None
@@ -172,6 +177,34 @@ def stats():
         s = dict(_stats)
     s["queued"] = _q.qsize()
     return s
+
+
+def day_count(person):
+    """Best-effort count of this PERSON's fulfillment orders for the current ET day.
+
+    Powers the "orders today" tile so the number is per-person-per-day, not
+    per-login: a packer who logs in fresh at 2pm still sees everything they
+    packed since midnight. Bounded and fail-safe -- a short connect/statement
+    timeout, and any error returns None so the caller falls back to the live
+    in-memory session count. Never blocks a login for more than a few seconds.
+    """
+    person = (person or "").strip()
+    url = os.environ.get("DATABASE_URL", "")
+    if psycopg is None or not person or not url:
+        return None
+    try:
+        with psycopg.connect(url, connect_timeout=4) as c, c.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = '4s'")
+            cur.execute(
+                "SELECT count(*) FROM event "
+                "WHERE source='logger' AND stage='pack' AND person=%s "
+                "AND et_day(ts)=et_day(now())",
+                (person,),
+            )
+            return int(cur.fetchone()[0])
+    except Exception as e:
+        print("[fulfill] day_count failed:", repr(e), flush=True)
+        return None
 
 
 _worker_thread = None
