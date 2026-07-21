@@ -83,8 +83,12 @@ def _write(batch):
         return False
     try:
         with connect() as c, c.cursor() as cur:
-            w = cf = 0
+            w = cf = dl = 0
             for it in batch:
+                if it.get("_op") == "delete":
+                    cur.execute(DELETE, it)
+                    dl += cur.rowcount
+                    continue
                 cur.execute(INSERT, it)
                 if cur.rowcount:
                     w += 1
@@ -94,9 +98,10 @@ def _write(batch):
         with _lock:
             _stats["written"] += w
             _stats["conflict"] += cf
+            _stats["voided"] = _stats.get("voided", 0) + dl
             _stats["last_write"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             _stats["last_error"] = None
-        print("[fulfill] +%d event(s), %d dup" % (w, cf), flush=True)
+        print("[fulfill] +%d event(s), %d dup, -%d void" % (w, cf, dl), flush=True)
         return True
     except Exception as e:
         with _lock:
@@ -137,6 +142,27 @@ def _worker():
             print("[fulfill] dropped %d row(s) after retries" % len(batch), flush=True)
         for _ in batch:
             _q.task_done()
+
+
+DELETE = "DELETE FROM event WHERE dedup_key = %(dedup)s AND source = 'logger'"
+
+
+def void(order):
+    """Undo a fulfillment scan: enqueue a DELETE of that order's logger pack row.
+
+    FIFO with record(): if the INSERT is still queued it runs first, then this
+    DELETE removes it; if already written, this DELETE removes it. Idempotent.
+    """
+    ordn = norm_order(order)
+    if not ordn:
+        return False
+    item = {"_op": "delete", "dedup": "logger|fulfill|%s" % ordn, "order": ordn}
+    try:
+        _q.put_nowait(item)
+        return True
+    except queue.Full:
+        print("[fulfill] queue full -- undo dropped", ordn, flush=True)
+        return False
 
 
 def stats():
