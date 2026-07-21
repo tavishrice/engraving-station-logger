@@ -234,6 +234,7 @@ async function sendScan(val){
 // order-format check (Ikigai orders are IC + 6 digits; a bare 6-digit core is fine too).
 function orderAlnum(v){return (v||'').toUpperCase().replace(/[^A-Z0-9]/g,'');}
 function looksLikeOrder(v){return /^(IC)?[0-9]{6}$/.test(orderAlnum(v));}
+function looksLikeTracking(v){return orderAlnum(v).length>=12;}  // shipping-label tracking barcode
 var mBox=$('manualBox');
 function showManual(raw){if(!mBox){sendScan(raw);return;}$('mRaw').textContent=raw;var m=$('manual');var d=(raw||'').replace(/[^0-9]/g,'');m.value=d?('IC'+d):'';$('scanForm').classList.add('hide');mBox.classList.remove('hide');feedback('err');setFlash('err','\\u2715 '+raw+' \\u2014 not a full order #, type it in');m.focus();m.select();}
 function hideManual(){if(mBox)mBox.classList.add('hide');$('scanForm').classList.remove('hide');$('scan').focus();}
@@ -241,7 +242,7 @@ if($('manualForm')){$('manualForm').addEventListener('submit',function(e){e.prev
 if($('mCancel')){$('mCancel').addEventListener('click',function(e){e.preventDefault();hideManual();});}
 $('scanForm').addEventListener('submit',e=>{e.preventDefault();var t=$('scan').value.trim();$('scan').value='';if(!t){$('scan').focus();return;}
   var now=Date.now();if(t===lastVal&&now-lastT<800){$('scan').focus();return;}lastVal=t;lastT=now;
-  if(CFG.validateOrder&&!looksLikeOrder(t)){showManual(t);return;}
+  if(CFG.validateOrder&&!looksLikeOrder(t)&&!looksLikeTracking(t)){showManual(t);return;}
   sendScan(t);$('scan').focus();});
 
 var undoBtn=$('undo');
@@ -344,7 +345,7 @@ def fulfill_page():
     # person, so the station is irrelevant here.
     return _scan(FULFILLERS, "#2E9B6B", "#14432f", "fulfillment", "order", "orders",
                  "packing rush orders", "pack",
-                 "Scan the packing slip / order barcode for each Shopify order you fulfill.",
+                 "Scan the order barcode OR the shipping-label tracking barcode for each order.",
                  "/fulfill/login", "/fulfill/log", "/fulfill/logout", "/fulfill/state",
                  "/fulfill/undo", "order", "/", "home", "Fulfillment", True, True)
 
