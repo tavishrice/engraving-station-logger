@@ -50,6 +50,7 @@ def norm_order(s):
 
 def record(person, station, order, scanned_raw=None, ts=None):
     """Enqueue one fulfilled order for a background DB write. Never blocks on I/O."""
+    _ensure_worker()
     person = (person or "").strip()
     ordn = norm_order(order)
     if not person or not ordn:
@@ -153,6 +154,7 @@ def void(order):
     FIFO with record(): if the INSERT is still queued it runs first, then this
     DELETE removes it; if already written, this DELETE removes it. Idempotent.
     """
+    _ensure_worker()
     ordn = norm_order(order)
     if not ordn:
         return False
@@ -172,14 +174,29 @@ def stats():
     return s
 
 
-_started = False
+_worker_thread = None
+_start_lock = threading.Lock()
+
+
+def _ensure_worker():
+    """Guarantee a LIVE writer thread in THIS process.
+
+    Called from record()/void() (which run in the gunicorn worker process, after
+    any fork). A thread started at import under `gunicorn --preload` lives only in
+    the master and does NOT survive the fork, so an import-time start is not
+    enough -- we (re)start here if the thread isn't alive in this process.
+    """
+    global _worker_thread
+    if _worker_thread is not None and _worker_thread.is_alive():
+        return
+    with _start_lock:
+        if _worker_thread is not None and _worker_thread.is_alive():
+            return
+        _worker_thread = threading.Thread(target=_worker, name="fulfill-writer", daemon=True)
+        _worker_thread.start()
+        print("[fulfill] background writer started (pid-local)", flush=True)
 
 
 def start():
-    """Start the single background writer thread (idempotent, per worker process)."""
-    global _started
-    if _started:
-        return
-    threading.Thread(target=_worker, name="fulfill-writer", daemon=True).start()
-    _started = True
-    print("[fulfill] background writer started", flush=True)
+    """Kept for import-time call in app.py; real guarantee is _ensure_worker()."""
+    _ensure_worker()
